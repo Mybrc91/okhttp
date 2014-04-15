@@ -27,11 +27,16 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
@@ -42,9 +47,14 @@ import org.jsoup.nodes.Element;
 public final class Crawler {
   public static final Charset UTF_8 = Charset.forName("UTF-8");
 
+  private final ScheduledExecutorService canceler = Executors.newScheduledThreadPool(1);
   private final OkHttpClient client;
-  private final Set<URL> fetchedUrls = Collections.synchronizedSet(new LinkedHashSet<URL>());
+  private final Set<String> fetchedUrls = Collections.synchronizedSet(new LinkedHashSet<String>());
   private final LinkedBlockingQueue<URL> queue = new LinkedBlockingQueue<URL>();
+
+  private final Map<String, AtomicInteger> domainCounts
+      = new LinkedHashMap<String, AtomicInteger>();
+  private static final int domainMaximum = 20;
 
   public Crawler(OkHttpClient client) {
     this.client = client;
@@ -68,8 +78,14 @@ public final class Crawler {
 
   private void drainQueue() throws Exception {
     for (URL url; (url = queue.take()) != null; ) {
-      if (!fetchedUrls.add(url)) {
+      if (!fetchedUrls.add(url.toString())) {
         continue;
+      }
+
+      synchronized (domainCounts) {
+        AtomicInteger domainCount = domainCounts.get(url.getHost());
+        if (domainCount == null) domainCounts.put(url.getHost(), domainCount = new AtomicInteger());
+        if (domainCount.incrementAndGet() > domainMaximum) continue;
       }
 
       try {
@@ -82,6 +98,9 @@ public final class Crawler {
 
   public void fetch(URL url) throws IOException {
     HttpURLConnection connection = client.open(url);
+
+    disconnectLater(connection);
+
     String responseSource = connection.getHeaderField(OkHeaders.RESPONSE_SOURCE);
     String contentType = connection.getHeaderField("Content-Type");
     int responseCode = connection.getResponseCode();
@@ -93,21 +112,33 @@ public final class Crawler {
       return;
     }
 
-    InputStream in = connection.getInputStream();
-    if (responseCode != 200 || contentType == null) {
-      in.close();
-      return;
-    }
+    InputStream in = null;
+    try {
+      in = connection.getInputStream();
+      if (responseCode != 200 || contentType == null) {
+        return;
+      }
 
-    MediaType mediaType = MediaType.parse(contentType);
-    Document document = Jsoup.parse(in, mediaType.charset(UTF_8).name(), url.toString());
-    for (Element element : document.select("a[href]")) {
-      String href = element.attr("href");
-      URL link = parseUrl(url, href);
-      if (link != null) queue.add(link);
+      MediaType mediaType = MediaType.parse(contentType);
+      Document document = Jsoup.parse(in, mediaType.charset(UTF_8).name(), url.toString());
+      for (Element element : document.select("a[href]")) {
+        String href = element.attr("href");
+        URL link = parseUrl(url, href);
+        if (link != null) queue.add(link);
+      }
+    } finally {
+      if (in != null) {
+        in.close();
+      }
     }
+  }
 
-    in.close();
+  private void disconnectLater(final HttpURLConnection connection) {
+    canceler.schedule(new Runnable() {
+      @Override public void run() {
+        connection.disconnect();
+      }
+    }, 2, TimeUnit.SECONDS);
   }
 
   private URL parseUrl(URL url, String href) {
@@ -121,7 +152,7 @@ public final class Crawler {
     }
   }
 
-  public static void main(String[] args) throws IOException {
+  public static void main(String[] args) throws IOException, InterruptedException {
     if (args.length != 2) {
       System.out.println("Usage: Crawler <cache dir> <root>");
       return;
@@ -137,5 +168,7 @@ public final class Crawler {
     Crawler crawler = new Crawler(client);
     crawler.queue.add(new URL(args[1]));
     crawler.parallelDrainQueue(threadCount);
+
+    Thread.sleep(TimeUnit.MINUTES.toMillis(60));
   }
 }
